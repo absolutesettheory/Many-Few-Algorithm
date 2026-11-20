@@ -15,7 +15,7 @@ from dataclasses import dataclass, asdict
 from fractions import Fraction
 from itertools import combinations, product
 from math import gcd, isqrt
-from typing import Any, Callable, Dict, FrozenSet, Iterable, Mapping, Sequence, Tuple, Type
+from typing import Any, Callable, Dict, FrozenSet, Mapping, Sequence, Tuple, Type
 import argparse
 import json
 
@@ -107,16 +107,21 @@ def verify_proof_dag(steps: Sequence[ProofStep], target: str) -> ProofDAGResult:
     """Check dependency integrity, acyclicity, typing, and each local rule.
 
     This validates a supplied proof certificate; soundness still depends on
-    the correctness of each registered/supplied local checker.
+    the correctness of each registered/supplied local checker. A checker is
+    given only its declared premises, so it cannot depend on unrelated nodes.
     """
     by_id: Dict[str, ProofStep] = {}
     errors = []
     for step in steps:
+        if not isinstance(step, ProofStep):
+            errors.append(f"invalid proof-step object: {type(step).__name__}")
+            continue
         if step.identifier in by_id:
             errors.append(f"duplicate proof-step identifier: {step.identifier}")
+            continue
         by_id[step.identifier] = step
     if target not in by_id:
-        return ProofDAGResult("ILL_TYPED", target, (), {}, ("target node is missing",))
+        return ProofDAGResult("ILL_TYPED", target, (), {}, tuple(errors + ["target node is missing"]))
 
     order = []
     visiting = set()
@@ -146,12 +151,16 @@ def verify_proof_dag(steps: Sequence[ProofStep], target: str) -> ProofDAGResult:
     node_results: Dict[str, bool] = {}
     for node_id in order:
         step = by_id[node_id]
-        premises_ok = all(node_results.get(premise_id, False) for premise_id in step.premises)
-        if not premises_ok:
+        # Do not execute a rule if any declared premise is missing or failed.
+        if any(premise_id not in node_results or not node_results[premise_id]
+               for premise_id in step.premises):
             node_results[node_id] = False
             continue
+        # Restrict the checker context to this node's declared dependencies.
+        premise_results = {premise_id: node_results[premise_id]
+                           for premise_id in step.premises}
         try:
-            node_results[node_id] = bool(step.checker(node_results))
+            node_results[node_id] = bool(step.checker(premise_results))
         except Exception as exc:  # a malformed checker is a failed certificate step
             errors.append(f"checker failed at {node_id}: {type(exc).__name__}: {exc}")
             node_results[node_id] = False
@@ -480,6 +489,8 @@ def demo_problems() -> Dict[str, Any]:
 
 def enumerate_pythagorean_bruteforce(limit: int) -> FrozenSet[Tuple[int, int, int]]:
     """All unordered positive integer triples with hypotenuse <= limit."""
+    if type(limit) is not int or limit < 0:
+        raise ValueError("limit must be a non-negative integer")
     triples = set()
     for a in range(1, limit + 1):
         for b in range(a, limit + 1):
@@ -492,6 +503,8 @@ def enumerate_pythagorean_bruteforce(limit: int) -> FrozenSet[Tuple[int, int, in
 
 def enumerate_pythagorean_euclid(limit: int) -> FrozenSet[Tuple[int, int, int]]:
     """Independent generation using Euclid's primitive-triple parameterization."""
+    if type(limit) is not int or limit < 0:
+        raise ValueError("limit must be a non-negative integer")
     triples = set()
     for m in range(2, isqrt(limit) + 1):
         for n in range(1, m):
@@ -550,6 +563,17 @@ def run_self_tests() -> Dict[str, Any]:
     ), "conclusion_Q")
     dag_ok = dag.status == "VERIFIED"
 
+    # A rule must not be able to read a true but undeclared node as a premise.
+    isolated_premise = verify_proof_dag((
+        ProofStep("declared", "logic", "P", (), lambda _: True),
+        ProofStep("undeclared", "logic", "R", (), lambda _: True),
+        ProofStep("target", "logic", "Q", ("declared",),
+                  lambda known: known["undeclared"]),
+    ), "target")
+    premise_scope_ok = (isolated_premise.status == "REFUTED_OR_INCOMPLETE"
+                        and any("checker failed at target" in error
+                                for error in isolated_premise.errors))
+
     exhaustive_checks = {
         "finite_set_partition": {"universe_size": 4, "subsets_checked": subset_checks,
                                  "all_partitions_verified": subset_exhaustive_ok},
@@ -560,8 +584,10 @@ def run_self_tests() -> Dict[str, Any]:
         "proof_dag_modus_ponens": {"status": dag.status,
                                    "dependency_order": list(dag.dependency_order),
                                    "no_errors": not dag.errors},
+        "proof_dag_premise_scope": {"status": isolated_premise.status,
+                                     "undeclared_premise_rejected": premise_scope_ok},
     }
-    if not subset_exhaustive_ok or not pythagorean_exhaustive_ok or not dag_ok:
+    if not subset_exhaustive_ok or not pythagorean_exhaustive_ok or not dag_ok or not premise_scope_ok:
         failures.append("exhaustive_or_proof_dag_checks")
 
     return {
